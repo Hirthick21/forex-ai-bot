@@ -13,19 +13,23 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
-PAIR = os.getenv("PAIR", "EUR/USD")
 
-SCAN_SECONDS = 60
+PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY"]
+
+SCAN_SECONDS = 120
+PAIR_DELAY_SECONDS = 5
 COOLDOWN_SECONDS = 900
 
 MIN_CONFIDENCE = 75
 MIN_RR = 1.8
 
-MIN_SL_DISTANCE = 0.0010  # 10 pips for EUR/USD
-RR_TARGET = 2.0
+MIN_SL_DISTANCE = {
+    "EUR/USD": 0.0010,
+    "GBP/USD": 0.0012,
+    "USD/JPY": 0.10,
+}
 
-LAST_SIGNAL_TIME = 0
-LAST_SIGNAL_SIDE = None
+RR_TARGET = 2.0
 
 
 # ======================================================
@@ -58,11 +62,11 @@ def send_telegram(message):
 # TWELVE DATA
 # ======================================================
 
-def get_candles(interval="5min", outputsize=120):
+def get_candles(pair, interval="5min", outputsize=120):
     try:
         url = "https://api.twelvedata.com/time_series"
         params = {
-            "symbol": PAIR,
+            "symbol": pair,
             "interval": interval,
             "outputsize": outputsize,
             "apikey": TWELVE_API_KEY,
@@ -71,10 +75,11 @@ def get_candles(interval="5min", outputsize=120):
         data = requests.get(url, params=params, timeout=10).json()
 
         if "values" not in data:
-            print("Twelve Data error:", data)
+            print(f"{pair} Twelve Data error:", data)
             return []
 
         candles = []
+
         for c in reversed(data["values"]):
             candles.append({
                 "time": c["datetime"],
@@ -88,7 +93,7 @@ def get_candles(interval="5min", outputsize=120):
         return candles
 
     except Exception as e:
-        print("Candle fetch error:", e)
+        print(f"{pair} candle fetch error:", e)
         return []
 
 
@@ -112,6 +117,7 @@ def ema(values, period):
 def sma(values, period):
     if len(values) < period:
         return None
+
     return round(sum(values[-period:]) / period, 5)
 
 
@@ -153,6 +159,7 @@ def atr(candles, period=14):
             abs(high - prev_close),
             abs(low - prev_close),
         )
+
         trs.append(tr)
 
     return round(sum(trs[-period:]) / period, 5)
@@ -181,15 +188,11 @@ def support_resistance(candles, lookback=50):
     recent = candles[-lookback:]
     support = min(c["low"] for c in recent)
     resistance = max(c["high"] for c in recent)
+
     return round(support, 5), round(resistance, 5)
 
 
 def detect_fvg(candles, lookback=40):
-    """
-    Simple 3-candle Fair Value Gap detection.
-    Bullish FVG: candle 3 low > candle 1 high.
-    Bearish FVG: candle 3 high < candle 1 low.
-    """
     fvgs = []
     recent = candles[-lookback:]
 
@@ -215,10 +218,6 @@ def detect_fvg(candles, lookback=40):
 
 
 def detect_ndog(candles):
-    """
-    New Day Opening Gap.
-    Approximate using current UTC day first candle vs previous candle close.
-    """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     today_candles = [c for c in candles if c["time"].startswith(today)]
@@ -231,7 +230,8 @@ def detect_ndog(candles):
     prev_close = previous[-1]["close"]
     gap = round(day_open - prev_close, 5)
 
-    if abs(gap) < 0.00005:
+    threshold = 0.00005
+    if abs(gap) < threshold:
         return None
 
     return {
@@ -243,10 +243,6 @@ def detect_ndog(candles):
 
 
 def detect_nwog(candles):
-    """
-    New Week Opening Gap.
-    Simple approximation using ISO week.
-    """
     now_week = datetime.now(timezone.utc).isocalendar().week
 
     this_week = []
@@ -255,10 +251,12 @@ def detect_nwog(candles):
     for c in candles:
         try:
             candle_week = datetime.fromisoformat(c["time"]).isocalendar().week
+
             if candle_week == now_week:
                 this_week.append(c)
             else:
                 old.append(c)
+
         except Exception:
             continue
 
@@ -269,7 +267,8 @@ def detect_nwog(candles):
     prev_close = old[-1]["close"]
     gap = round(week_open - prev_close, 5)
 
-    if abs(gap) < 0.00005:
+    threshold = 0.00005
+    if abs(gap) < threshold:
         return None
 
     return {
@@ -282,8 +281,10 @@ def detect_nwog(candles):
 
 def session_ok():
     hour = datetime.now(timezone.utc).hour
+
     london = 7 <= hour <= 16
     new_york = 12 <= hour <= 21
+
     return london or new_york
 
 
@@ -292,6 +293,9 @@ def session_ok():
 # ======================================================
 
 def analyze_timeframe(candles):
+    if len(candles) < 70:
+        return None
+
     closes = [c["close"] for c in candles]
     price = closes[-1]
 
@@ -342,23 +346,23 @@ def gap_confluence(gap, price, atr_value):
     return gap["low"] - atr_value <= price <= gap["high"] + atr_value
 
 
-def build_signal():
-    candles_5m = get_candles("5min", 120)
-    candles_15m = get_candles("15min", 120)
+def build_signal(pair):
+    candles_5m = get_candles(pair, "5min", 120)
+    candles_15m = get_candles(pair, "15min", 120)
 
     if len(candles_5m) < 70 or len(candles_15m) < 70:
-        print("Not enough candle data.")
+        print(f"{pair}: Not enough candle data.")
         return None
 
     tf5 = analyze_timeframe(candles_5m)
     tf15 = analyze_timeframe(candles_15m)
 
     if not tf5 or not tf15:
-        print("Indicator analysis failed.")
+        print(f"{pair}: Indicator analysis failed.")
         return None
 
     if not session_ok():
-        print("Outside London/New York session.")
+        print(f"{pair}: Outside London/New York session.")
         return None
 
     price = tf5["price"]
@@ -373,9 +377,10 @@ def build_signal():
     reasons = []
     warnings = []
     side = None
+    active_fvg = None
 
     print(
-        f"{datetime.now()} | {PAIR} | Price={price} | "
+        f"{datetime.now()} | {pair} | Price={price} | "
         f"5m={tf5['trend']} 15m={tf15['trend']} | "
         f"RSI={tf5['rsi']} VWAP={tf5['vwap']} ATR={atr_value}"
     )
@@ -403,7 +408,6 @@ def build_signal():
             confidence += 20
             reasons.append(f"Bullish FVG active: {active_fvg['low']} - {active_fvg['high']}")
         else:
-            active_fvg = None
             warnings.append("No nearby bullish FVG")
 
         if gap_confluence(ndog, price, atr_value):
@@ -418,7 +422,9 @@ def build_signal():
             confidence += 7
             reasons.append(f"Price is holding above support {support}")
 
-        risk_distance = max(atr_value * 1.5, MIN_SL_DISTANCE)
+        min_sl = MIN_SL_DISTANCE.get(pair, 0.0010)
+        risk_distance = max(atr_value * 1.5, min_sl)
+
         stop_loss = round(price - risk_distance, 5)
         take_profit = round(price + risk_distance * RR_TARGET, 5)
 
@@ -445,7 +451,6 @@ def build_signal():
             confidence += 20
             reasons.append(f"Bearish FVG active: {active_fvg['low']} - {active_fvg['high']}")
         else:
-            active_fvg = None
             warnings.append("No nearby bearish FVG")
 
         if gap_confluence(ndog, price, atr_value):
@@ -460,7 +465,9 @@ def build_signal():
             confidence += 7
             reasons.append(f"Price is below resistance {resistance}")
 
-        risk_distance = max(atr_value * 1.5, MIN_SL_DISTANCE)
+        min_sl = MIN_SL_DISTANCE.get(pair, 0.0010)
+        risk_distance = max(atr_value * 1.5, min_sl)
+
         stop_loss = round(price + risk_distance, 5)
         take_profit = round(price - risk_distance * RR_TARGET, 5)
 
@@ -472,14 +479,15 @@ def build_signal():
     rr = round(reward / risk, 2) if risk > 0 else 0
 
     if confidence < MIN_CONFIDENCE:
-        print(f"Confidence too low: {confidence}%")
+        print(f"{pair}: Confidence too low: {confidence}%")
         return None
 
     if rr < MIN_RR:
-        print(f"RR too low: {rr}")
+        print(f"{pair}: RR too low: {rr}")
         return None
 
     return {
+        "pair": pair,
         "side": side,
         "entry": price,
         "stop_loss": stop_loss,
@@ -499,8 +507,6 @@ def build_signal():
 
 
 def send_signal(signal):
-    global LAST_SIGNAL_TIME, LAST_SIGNAL_SIDE
-
     emoji = "🟢" if signal["side"] == "BUY" else "🔴"
 
     reasons = "\n".join([f"✅ {r}" for r in signal["reasons"]])
@@ -522,7 +528,7 @@ def send_signal(signal):
         nwog_text = f"{g['direction']} {g['low']} - {g['high']}"
 
     message = f"""
-{emoji} <b>{PAIR} {signal['side']} ENTRY ZONE</b>
+{emoji} <b>{signal['pair']} {signal['side']} ENTRY ZONE</b>
 
 <b>Entry:</b> {signal['entry']}
 <b>Stop Loss:</b> {signal['stop_loss']}
@@ -561,32 +567,43 @@ NWOG: {nwog_text}
     send_telegram(message)
 
 
-def main():
-    global LAST_SIGNAL_TIME, LAST_SIGNAL_SIDE
+# ======================================================
+# MAIN LOOP
+# ======================================================
 
+def main():
     send_telegram(
         "🤖 <b>Forex Bot ONLINE</b>\n\n"
-        f"Pair: {PAIR}\n"
+        "Pairs: EUR/USD, GBP/USD, USD/JPY\n"
         "Strategy: EMA15 + SMA21 + VWAP + FVG + NDOG + NWOG\n"
         "Mode: Paper alerts only\n"
-        "Scan: Every 60 seconds"
+        "Scan: Every 120 seconds"
     )
 
+    last_signal_time = {}
+    last_signal_side = {}
+
     while True:
-        signal = build_signal()
+        for pair in PAIRS:
+            signal = build_signal(pair)
 
-        if signal:
-            now = time.time()
+            if signal:
+                now = time.time()
 
-            cooldown_ok = now - LAST_SIGNAL_TIME >= COOLDOWN_SECONDS
-            side_changed = signal["side"] != LAST_SIGNAL_SIDE
+                previous_time = last_signal_time.get(pair, 0)
+                previous_side = last_signal_side.get(pair)
 
-            if cooldown_ok or side_changed:
-                send_signal(signal)
-                LAST_SIGNAL_TIME = now
-                LAST_SIGNAL_SIDE = signal["side"]
-            else:
-                print("Signal skipped: cooldown active.")
+                cooldown_ok = now - previous_time >= COOLDOWN_SECONDS
+                side_changed = signal["side"] != previous_side
+
+                if cooldown_ok or side_changed:
+                    send_signal(signal)
+                    last_signal_time[pair] = now
+                    last_signal_side[pair] = signal["side"]
+                else:
+                    print(f"{pair}: Signal skipped, cooldown active.")
+
+            time.sleep(PAIR_DELAY_SECONDS)
 
         time.sleep(SCAN_SECONDS)
 
