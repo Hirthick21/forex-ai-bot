@@ -624,7 +624,68 @@ def nwog(candles, price, pair):
         "nearby": low - radius <= price <= high + radius,
     }
 
+def true_day_open_state(candles, price):
+    """
+    ICT True Day Open = 00:00 New York time.
+    Detects current price relationship and reclaim/rejection/sweep behavior.
+    """
+    ny_today = datetime.now(NY_TZ).date()
 
+    today = []
+    previous = []
+
+    for c in candles:
+        t = to_ny(c)
+
+        if t.date() == ny_today:
+            today.append(c)
+        elif t.date() < ny_today:
+            previous.append(c)
+
+    if not today:
+        return None
+
+    tdo_candle = today[0]
+    tdo_open = round(tdo_candle["open"], 5)
+    tdo_high = round(tdo_candle["high"], 5)
+    tdo_low = round(tdo_candle["low"], 5)
+
+    recent = today[-12:] if len(today) >= 12 else today
+
+    swept_below = any(c["low"] < tdo_low for c in recent)
+    swept_above = any(c["high"] > tdo_high for c in recent)
+
+    last = today[-1]
+    prev = today[-2] if len(today) >= 2 else today[-1]
+
+    # Reclaim/rejection logic
+    if prev["close"] < tdo_open and last["close"] > tdo_open:
+        state = "BULLISH_RECLAIM"
+
+    elif prev["close"] > tdo_open and last["close"] < tdo_open:
+        state = "BEARISH_REJECTION"
+
+    elif swept_below and price > tdo_open:
+        state = "TDO_SWEEP_BULLISH"
+
+    elif swept_above and price < tdo_open:
+        state = "TDO_SWEEP_BEARISH"
+
+    elif price > tdo_open:
+        state = "ABOVE_TDO_BULLISH"
+
+    elif price < tdo_open:
+        state = "BELOW_TDO_BEARISH"
+
+    else:
+        state = "AT_TDO_NEUTRAL"
+
+    return {
+        "open": tdo_open,
+        "high": tdo_high,
+        "low": tdo_low,
+        "state": state,
+    }
 # ======================================================
 # SIGNAL BUILDER
 # ======================================================
@@ -694,6 +755,7 @@ def build_signal(pair):
 
     nd = ndog(m5_c, price, pair)
     nw = nwog(m5_c, price, pair)
+    tdo = true_day_open_state(m5_c, price)
 
     spike, vol_ratio = volume_spike(m5_c)
     good_buy_candle, buy_candle_note = candle_quality(m5_c[-1], "BUY")
@@ -704,6 +766,36 @@ def build_signal(pair):
     for side in ["BUY", "SELL"]:
         confidence, reasons = aligned_with_bias(side, daily, h4, h1, m15)
         warnings = []
+        
+        # True Day Open state filter
+        if tdo:
+            bullish_tdo_states = [
+                "ABOVE_TDO_BULLISH",
+                "BULLISH_RECLAIM",
+                "TDO_SWEEP_BULLISH",
+            ]
+
+            bearish_tdo_states = [
+                "BELOW_TDO_BEARISH",
+                "BEARISH_REJECTION",
+                "TDO_SWEEP_BEARISH",
+            ]
+
+            if side == "BUY":
+                if tdo["state"] in bullish_tdo_states:
+                    confidence += 12
+                    reasons.append(f"TDO supports BUY: {tdo['state']}")
+                elif tdo["state"] in bearish_tdo_states:
+                    warnings.append(f"TDO blocks counter-trend BUY: {tdo['state']}")
+                    continue
+
+            if side == "SELL":
+                if tdo["state"] in bearish_tdo_states:
+                    confidence += 12
+                    reasons.append(f"TDO supports SELL: {tdo['state']}")
+                elif tdo["state"] in bullish_tdo_states:
+                    warnings.append(f"TDO blocks counter-trend SELL: {tdo['state']}")
+                    continue        
 
         pd_type, pd_array = nearest_pd_array(
             m5["fvgs"],
@@ -792,6 +884,7 @@ def build_signal(pair):
                 "newyork": newyork,
                 "ndog": nd,
                 "nwog": nw,
+                "tdo": tdo,
                 "volume_ratio": vol_ratio,
                 "session": current,
                 "reasons": reasons,
@@ -866,9 +959,11 @@ Asian: {fmt_range(s['asian'])} | {session_position(s['entry'], s['asian'])}
 London: {fmt_range(s['london'])} | {session_position(s['entry'], s['london'])}
 New York: {fmt_range(s['newyork'])} | {session_position(s['entry'], s['newyork'])}
 
-<b>Gap Logic:</b>
+<b>Gap / TDO Logic:</b>
 NDOG: {fmt_gap(s['ndog'])}
 NWOG: {fmt_gap(s['nwog'])}
+TDO: {s['tdo']['state'] if s.get('tdo') else 'None'} 
+TDO Open: {s['tdo']['open'] if s.get('tdo') else 'None'}
 
 <b>Reasons:</b>
 {reasons}
