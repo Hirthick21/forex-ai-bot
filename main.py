@@ -891,7 +891,7 @@ def main():
         "🤖 <b>Forex Bot V2.0 HTF Narrative ONLINE</b>\n\n"
         "Checklist:\n"
         "Daily Bias → 4H PD Array → 1H PD Array → 15m PD Array → 5m Entry\n\n"
-        "Pairs: EUR/USD, GBP/USD, USD/JPY\n"
+        "Pairs: GBP/USD\n"
         "Mode: Paper alerts only\n"
         "Scan: Every 5 minutes"
     )
